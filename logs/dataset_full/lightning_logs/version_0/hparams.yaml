@@ -1,0 +1,8 @@
+gpus: 1
+lr: 0.0001
+max_epochs: 100
+retrieve_layers: false
+retrieve_masks: false
+train_steps_per_epoch: 15875
+trainable_layers: 1
+transfer: false

@@ -1,0 +1,7 @@
+lr: 3.0e-05
+max_epochs: 40
+pos_weight: null
+retrieve_layers: false
+retrieve_masks: false
+trainable_layers: 1
+transfer: false
