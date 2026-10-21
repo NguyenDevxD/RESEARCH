@@ -1,271 +1,359 @@
-# FDM 3D Printing Quality Monitoring and Control via Residual Attention Network
+# FDM 3D Printing Quality Monitoring and Control Research
+
+This repository contains experimental code for image-based monitoring of Fused Deposition Modeling (FDM/FFF) 3D printing. The current primary training pipeline uses a residual-attention convolutional neural network to classify three visual quality attributes from images of the nozzle and extruded filament:
+
+- Uniformity
+- Continuity
+- Adhesion
+
+The repository also includes data preparation and capture utilities, camera streaming, inference scripts, and fuzzy-rule experiments for proposing process-parameter adjustments.
+
+> **Important:** This repository contains code from multiple stages of experimentation. The current classifier predicts three binary quality labels. Some older scripts refer to a different four-output regression/classification interface and should not be assumed to work with the current model.
+
+## Table of contents
+
+- [Project overview](#project-overview)
+- [Architecture](#architecture)
+- [Repository structure](#repository-structure)
+- [Dataset](#dataset)
+- [Environment setup](#environment-setup)
+- [Configuration](#configuration)
+- [Training](#training)
+- [Evaluation](#evaluation)
+- [Inference](#inference)
+- [Image capture and camera streaming](#image-capture-and-camera-streaming)
+- [Fuzzy-rule experiments](#fuzzy-rule-experiments)
+- [Limitations and reproducibility](#limitations-and-reproducibility)
+- [Recommended workflow](#recommended-workflow)
+- [License](#license)
+
+## Project overview
+
+The research investigates whether visual features around the nozzle and deposited filament can be used to classify print-quality states. The current classifier predicts three labels from an RGB image crop:
+
+1. **Uniformity**
+2. **Continuity**
+3. **Adhesion**
+
+These are image-based classification outputs. They are not direct measurements of flow rate, feed rate, Z offset, or hotend temperature, and a predicted quality label alone does not prove the physical cause of a defect.
+
+The repository also contains experimental fuzzy logic code that maps quality-label combinations to proposed changes in process parameters. This should be treated as research/prototype logic, not validated autonomous printer-control software.
+
+## Architecture
+
+The current classifier pipeline is:
+
+    Annotated image + CSV
+             |
+             v
+    ParametersDataset
+             |
+             v
+    Crop around nozzle tip
+             |
+             v
+    Resize / tensor conversion / normalization
+             |
+             v
+    ResidualAttentionModel_56 backbone
+             |
+       2048-D features
+             |
+      +------+------+ 
+      |      |      |
+      v      v      v
+    Uniform Continuity Adhesion
+      head     head    head
+      |        |       |
+      +--------+-------+
+               |
+               v
+      Three binary predictions
 
-## 1. Project Overview
-This repository contains the source code for an automated 3D printing quality monitoring and process control system for Fused Deposition Modeling (FDM) printers[cite: 4]. The system leverages a Deep Learning computer vision pipeline to analyze real-time extrusion morphology and a Fuzzy Logic controller to dynamically adjust printing parameters[cite: 3, 4]. 
+### Model details
 
-**Problem Statement:** Print quality in FDM is highly sensitive to parameter imbalances (e.g., flow rate, lateral feed rate, Z-offset, hotend temperature)[cite: 3]. Manual tuning is inefficient, error-prone, and lacks real-time adaptability[cite: 4].
-**Technical Objective:** To establish a closed-loop control system that predicts the deviation of four primary printing parameters from their optimal states using single-frame images, and automatically compensates for these deviations using confidence-weighted fuzzy logic[cite: 3, 4].
+The main model is ParametersClassifier in model/network_module.py.
 
-```mermaid
-flowchart LR
-    A[Image Dataset] --> B[Data Preprocessing]
-    B --> C[Residual Attention Network]
-    C --> D[Multi-Head Predictions]
-    D --> E[Fuzzy Logic Controller]
-    E --> F[G-Code Parameter Adjustment]
+- **Backbone:** ResidualAttentionModel_56 from model/residual_attention_network.py.
+- **Feature vector:** 2,048 features after adaptive average pooling.
+- **Prediction heads:** Three independent fully connected heads for uniformity, continuity, and adhesion.
+- **Output:** Three logits per image, ordered as uniformity, continuity, adhesion.
+- **Loss:** Binary cross-entropy with logits. The adhesion loss is weighted by 2.5, then added to the uniformity and continuity losses.
+- **Prediction rule:** Apply sigmoid to each logit; values greater than 0.5 are mapped to label 1, otherwise label 0.
 
-```
+In the current inference display, label 1 is presented as GOOD and label 0 as BAD. Confirm that the labels in your CSV follow this convention.
 
-## 2. Research Objectives and Scope
+## Repository structure
 
-* **Automated Evaluation:** Replace manual trial-and-error by predicting parameter deviations (Very Low, Low, Good, High, Too High) directly from visual extrusion characteristics.
+The main files in the current source tree are:
 
+| Path | Description |
+|---|---|
+| train.py | Main PyTorch Lightning training entry point |
+| train_config.py | Dataset paths, normalization statistics, learning rate, batch size, epoch count, and preprocessing |
+| data/dataset.py | Loads annotations and images, crops around nozzle coordinates, and returns the three quality labels |
+| data/data_module.py | Creates datasets and train/validation/test DataLoaders |
+| model/network_module.py | Classifier, loss functions, metrics, optimizer, and scheduler |
+| model/residual_attention_network.py | Residual-attention feature extractor |
+| model/attention_module.py | Attention modules used by the backbone |
+| model/basic_layers.py | Basic residual layers |
+| test.py | Test-set evaluation and prediction visualization |
+| predict.py | Single-image inference for the current three-output classifier |
+| make_data.py | Webcam capture, ROI preview, image saving, and CSV row generation |
+| data_process.py | Experimental CSV filtering and balancing code |
+| mapping.py | Generates rule_mapping_24.csv from predefined parameter/quality combinations |
+| features_mapping.csv | Example mapping between discretized parameter classes and quality labels |
+| fuzzy/ | Fuzzy rules, membership functions, parameter adjustment helpers, and experiments |
+| camera_server.py | MJPEG camera stream and snapshot endpoints |
+| simulation.py | Experimental webcam loop integrating classification and fuzzy rules |
+| samples.py | Legacy sample inference script; see compatibility notes below |
 
-* **Closed-Loop Correction:** Apply bounded, confidence-aware parameter adjustments in real-time to stabilize the printing process.
+The repository does not currently include a dependency lockfile or requirements.txt. The complete dataset and a portable, documented checkpoint download are not provided as part of the source tree.
 
+## Dataset
 
-* **Scope Limitations:** The baseline model infers parameter deviations based on observed morphology; it does not deterministically measure the physical geometry of the extrusion or isolate complex mechanical failures (e.g., axis binding, bed leveling anomalies) that may produce similar visual artifacts.
+The main dataset loader expects a CSV annotation file and image files on disk.
 
+### Required CSV fields
 
+The current ParametersDataset in data/dataset.py accesses these fields:
 
-## 3. System Architecture
+| Column | Description |
+|---|---|
+| img_path | Image path joined to the configured root directory |
+| nozzle_tip_x | Horizontal coordinate used to center the crop |
+| nozzle_tip_y | Vertical coordinate used to center the crop |
+| uniformity | Binary target label |
+| continuity | Binary target label |
+| adhesion | Binary target label |
 
-The software architecture bridges a PyTorch Lightning-based Deep Learning framework with a Sugeno-type Fuzzy Inference System.
+Illustrative CSV header and row:
 
-* **Data Pipeline:** Crops regions of interest (ROI) around the nozzle tip, resizes to 224x224, and applies normalization.
+    img_path,nozzle_tip_x,nozzle_tip_y,uniformity,continuity,adhesion
+    caxton_dataset/images/example.jpg,320,240,1,1,0
 
+Replace the example path and labels with valid annotations. The image path must resolve after the loader joins it with DATA_DIR.
 
-* **Model Architecture:** A Residual Attention Network-56 acts as the shared feature extractor. The network employs trunk branches for residual feature learning and mask branches for spatial attention modulation, enhancing salient filament regions while suppressing background noise.
+### Image preprocessing
 
+The main data module performs the following operations:
 
-* **Prediction Heads:** Four independent fully connected heads output logits for Flow Rate, Feed Rate, Z-Offset, and Hotend Temperature.
+1. Loads the image as RGB.
+2. Crops a region around the nozzle coordinates. The default crop dimension is 320 × 320 pixels.
+3. For training, applies random rotation and random perspective before cropping.
+4. Applies random resized crop, horizontal flip, and color jitter to the cropped image.
+5. Converts the image to a tensor and normalizes it to 224 × 224 input size.
 
+When the data module is created with transform=False, it uses deterministic resizing, tensor conversion, and normalization rather than the training augmentation pipeline.
 
-* **Fuzzy Controller:** Aggregates predictions over a temporal window to calculate a "Confidence" score (0.0 to 1.0) based on majority voting. This confidence, paired with the predicted class, determines the final adjustment gain ($\Delta P$).
+The current channel-wise normalization constants in train_config.py are:
 
+- Mean: [0.288, 0.266, 0.137]
+- Standard deviation: [0.196, 0.194, 0.173]
 
+These values should correspond to the dataset used for training. Recalculate or verify them when using a different dataset.
 
-```mermaid
-flowchart TD
-    A[Input: 224x224 Image] --> B[Convolutional Stem]
-    B --> C[Residual Block 1 + Attention]
-    C --> D[Residual Block 2 + Attention]
-    D --> E[Residual Block 3 + Attention]
-    E --> F[Residual Blocks 4, 5, 6]
-    F --> G[Global Average Pooling]
-    G --> H[Flatten]
-    H --> I1[Head 0: Flow Rate]
-    H --> I2[Head 1: Feed Rate]
-    H --> I3[Head 2: Z Offset]
-    H --> I4[Head 3: Hotend Temp]
+### Train/validation/test split
 
-```
+The data module uses a nominal 70% training, 20% validation, and 10% test split. However, in the current implementation, random_split is called separately when creating the training/validation split and the test split if saved splits are not loaded. These independent splits can overlap. Do not treat the resulting test score as a reliable held-out estimate until this split logic is corrected.
 
-## 4. Repository Structure
+For reproducible evaluation, create one split using a fixed random seed, persist the sample indices or file lists, and reuse the same non-overlapping split for every experiment.
 
-```text
-RESEARCH/
-├── data/                  # PyTorch Lightning DataModules and Dataset definitions
-├── fuzzy/                 # Fuzzy logic inference system, rules, and membership functions
-├── lightning_logs/        # TensorBoard logs, hparams, and model checkpoints
-├── logs/                  # Experimental logs and inference histories
-├── model/                 # Network architecture (Residual blocks, Attention modules)
-├── camera_server.py       # Camera acquisition and monitoring server
-├── data_process.py        # Dataset cropping, formatting, and pre-processing scripts
-├── predict.py             # Script for executing single/batch inference
-├── samples.py             # Preliminary smoke-testing and sampling execution
-├── train.py               # Main training entry point
-├── train_config.py        # Centralized hyperparameter and environment configuration
-└── README.md
+## Environment setup
 
-```
+The code imports PyTorch, TorchVision, PyTorch Lightning, pandas, NumPy, Pillow, OpenCV, and Matplotlib. Flask is used by the camera server.
 
-## 5. Dataset Preparation
+Create and activate a virtual environment:
 
-The dataset consists of RGB images capturing the nozzle and the immediately extruded filament. Proper dataset preparation is critical for model convergence.
+    git clone https://github.com/NguyenDevxD/RESEARCH.git
+    cd RESEARCH
+    python -m venv .venv
 
-1. **Sourcing & Extraction:** Images are matched with their corresponding parameter labels via `features_mapping.csv`.
+**Windows PowerShell**
 
+    .venv\Scripts\Activate.ps1
 
-2. **Cropping:** Images must be tightly cropped around the nozzle tip to remove irrelevant build-plate background.
+**Linux/macOS**
 
+    source .venv/bin/activate
 
-3. **Transformations:** Pre-crop spatial transformations (random rotation, perspective shifts) are applied to simulate camera vibrations. Post-crop, images are resized to `224x224`.
+Install PyTorch and TorchVision using the official selector for your operating system and CUDA configuration: https://pytorch.org/get-started/locally/
 
+Install the other dependencies:
 
-4. **Normalization:** Dataset-specific channel-wise mean and standard deviation normalization is applied.
+    python -m pip install --upgrade pip
+    python -m pip install pytorch-lightning pandas numpy pillow opencv-python matplotlib flask
 
+This is a starting environment, not a pinned or fully tested dependency specification. Record the versions of Python, PyTorch, TorchVision, PyTorch Lightning, CUDA, and the GPU used for each reproducible experiment.
 
-5. **Splitting:** The dataset is split into 70% Training, 20% Validation, and 10% Testing subsets.
+## Configuration
 
+### train_config.py
 
-6. **Labels:** Each parameter is discretized into 5 classes (`0: Very Low`, `1: Low`, `2: Good`, `3: High`, `4: Very High`).
+Review these settings before training:
 
+| Setting | Current source value | Purpose |
+|---|---|---|
+| DATA_DIR | Absolute Windows path | Root directory used to resolve image paths |
+| DATASET_NAME | dataset_full | Dataset/log naming identifier |
+| DATA_CSV | DATA_DIR + caxton_dataset/full_data.csv | Annotation CSV |
+| DATASET_MEAN | [0.288, 0.266, 0.137] | Image normalization mean |
+| DATASET_STD | [0.196, 0.194, 0.173] | Image normalization standard deviation |
+| INITIAL_LR | 1e-3 | Learning rate passed to the model |
+| BATCH_SIZE | 32 | Batch size passed to the data module |
+| MAX_EPOCHS | 40 | Default maximum epoch count |
+| NUM_GPUS | 1 | GPU count requested when CUDA is available |
 
+**Change DATA_DIR and verify DATA_CSV on your machine.** The committed path is machine-specific and will not work on a different system without editing.
 
-## 6. Environment Setup
+### Batch size
 
-To set up the development environment:
+BATCH_SIZE is defined in train_config.py and passed by train.py into ParametersDataModule. The data module uses this batch size for training, validation, and test DataLoaders.
 
-```bash
-git clone [https://github.com/NguyenDevxD/RESEARCH.git](https://github.com/NguyenDevxD/RESEARCH.git)
-cd RESEARCH
+Change BATCH_SIZE in train_config.py to adjust it. If GPU memory is insufficient, try a smaller batch size. The DataLoaders currently use num_workers=7 and pin_memory=True; reduce the worker count in data/data_module.py if multiprocessing causes problems on your platform.
 
-# Create a virtual environment
-python -m venv .venv
+### Learning rate, optimizer, and scheduler
 
-# Activate (Windows)
-.venv\Scripts\activate
-# Activate (Linux/macOS)
-source .venv/bin/activate
+The current implementation uses **one shared learning rate**. The model's configure_optimizers method creates a single AdamW optimizer over the model parameters with:
 
-# Install dependencies (ensure matching CUDA versions for PyTorch)
-pip install torch torchvision pytorch-lightning opencv-python pandas matplotlib
+- Learning rate from INITIAL_LR (currently 1e-3 in train_config.py).
+- Weight decay of 1e-4.
+- OneCycleLR scheduling, with max_lr equal to the configured learning rate.
+- pct_start=0.1, cosine annealing, div_factor=25, and final_div_factor=100.
+- Scheduler updates at every training step.
 
-```
+The current source does **not** implement separate learning rates for the CNN backbone and the classification heads, despite this being a possible experiment. To test separate rates, modify configure_optimizers in model/network_module.py to create separate optimizer parameter groups for attention_model and the three fc_* heads, then expose the corresponding values in the configuration. Ensure each trainable parameter appears in exactly one group. Compare the shared-rate and separate-rate settings using the same fixed validation split.
 
-*Note: Depending on your hardware, install the specific PyTorch version built for your CUDA toolkit.*
+### Checkpoint initialization
 
-## 7. Training Configuration
+train.py contains a hard-coded Windows CHECKPOINT_PATH. If the path exists, the script attempts to load backbone weights from that checkpoint; otherwise it trains from scratch. Edit or remove this path before running on another machine. Only use a checkpoint compatible with the ResidualAttentionModel_56 backbone.
 
-Hyperparameters are primarily controlled via `train_config.py`.
+## Training
 
-| Parameter | Meaning | Source | Default / Current Value |
-| --- | --- | --- | --- |
-| `batch_size` | Number of samples per batch | Data module | `32`<br> |
-| `learning_rate` | Base learning rate | Optimizer config | `1e-3`<br> |
-| `epochs` | Total training epochs | Training config | `60` (up to `125`)
+After updating the data paths and checking that the CSV and images are valid, run:
 
- |
-| `optimizer` | Weight update algorithm | Training config | `AdamW`<br> |
-| `scheduler` | LR decay policy | Training config | `ReduceLROnPlateau`<br> |
-| `image_size` | Input tensor resolution | Preprocessing | `224x224`<br> |
+    python train.py --seed 1234 --epochs 40
 
-### Learning Rate Architecture Options
+Arguments:
 
-The repository supports evaluating different learning rate distributions across the network layers:
+- --seed: random seed (default: 1234).
+- --epochs: maximum number of epochs (defaults to MAX_EPOCHS in train_config.py).
 
-* **Strategy A (Unified LR):** A single learning rate (`1e-3`) is applied globally. This is the standard baseline.
+The script creates a PyTorch Lightning Trainer with mixed precision (16-mixed), gradient clipping at 1.0, TensorBoard logging, and a rich progress bar. It uses a GPU if CUDA is available and otherwise falls back to CPU.
 
+Outputs are written to directories based on the dataset name and seed:
 
-* **Strategy B (Split LR):** Separate parameter groups are instantiated to apply a lower learning rate to the CNN backbone (preserving pre-trained generic feature extraction weights) and a higher learning rate to the newly initialized multi-head classifiers. This can be configured in the optimizer setup.
+- Logs: logs/<dataset_name>_classifier_<seed>/
+- Checkpoints: checkpoints/<dataset_name>_classifier_<seed>/
 
+The checkpoint callback monitors val_acc_adhesion and saves the best checkpoint according to that metric. Therefore, checkpoint selection prioritizes adhesion validation accuracy rather than an aggregate score across all three outputs.
 
+### TensorBoard
 
-### Batch Size
+Install TensorBoard if needed and start it with:
 
-The default `batch_size` is 32. This value offers a stable gradient estimation across the 4 loss heads while accommodating standard GPU VRAM limits. If encountering Out-Of-Memory (OOM) errors, reduce the batch size in the data module or via CLI arguments, and consider adjusting the learning rate proportionally.
+    python -m pip install tensorboard
+    tensorboard --logdir logs
 
-## 8. Training Workflow
+Open the local URL shown in the terminal to inspect logged metrics.
 
-1. **Prepare Data:** Ensure the CSV mapping and image directories are accessible.
-2. **Initialize Training:** Run the training script:
-```bash
-python train.py
+## Evaluation
 
-```
+test.py evaluates the classifier and visualizes sample predictions. Before running it, update the hard-coded checkpoint path in test.py and confirm that train_config.py points to the intended dataset.
 
+Run:
 
-3. **Pipeline Execution:**
-* The `DataModule` loads and augments the 70/20/10 splits.
+    python test.py --seed 1234
 
+The script reports accuracy for uniformity, continuity, and adhesion, calculates mean accuracy, and displays example test images with predictions and labels.
 
-* The `ResidualAttentionModel` initializes the backbone and 4 linear heads.
+**Evaluation warning:** Fix the split overlap described above before using these metrics as a scientific test result. A valid evaluation requires a fixed, non-overlapping test set that was not used for training or hyperparameter selection.
 
+## Inference
 
-* Forward pass generates logits for Flow Rate, Feed Rate, Z-Offset, and Hotend.
+predict.py is the example inference script for the current three-output classifier. Before running it, configure:
 
+- CKPT_PATH: a checkpoint created for ParametersClassifier.
+- IMG_PATH: the image to analyze.
+- NOZZLE_TIP: the nozzle-tip coordinate in the full image.
+- IMAGE_DIM: crop size around the nozzle tip.
 
-* Categorical Cross-Entropy loss is calculated independently per head and summed: `Loss_Total = Loss0 + Loss1 + Loss2 + Loss3`.
+Then run:
 
+    python predict.py
 
-* `AdamW` updates weights, and `ReduceLROnPlateau` monitors `val_loss` for decay.
+The script chooses CUDA when available, loads the checkpoint, crops around the configured nozzle coordinates, converts the crop to RGB, resizes and normalizes it, and prints a GOOD/BAD result and sigmoid probability for each output. It also displays the original image with the crop region and the crop itself.
 
+The crop position and preprocessing must be consistent with training. Incorrect nozzle coordinates or a crop that differs substantially from training images can degrade predictions.
 
+### Legacy samples.py compatibility
 
+The current samples.py script expects four outputs and uses a legacy checkpoint-loading interface. The current ParametersClassifier returns one tensor containing three logits. Therefore, samples.py should not be assumed to run with the current classifier without modification. Use predict.py for the current model or update samples.py to match the current model interface.
 
-4. **Checkpointing:** PyTorch Lightning automatically saves checkpoints to `lightning_logs/` based on the lowest aggregated validation loss.
+## Image capture and camera streaming
 
+### Capture images with make_data.py
 
+make_data.py opens a camera, displays the full frame and the region of interest, saves cropped images, and appends annotations to dataset/data.csv. Its configurable fields include camera index, ROI position, crop dimensions, process-parameter metadata, quality labels, and capture interval.
 
-## 9. Model Evaluation
+The values in the script are examples. Change them to match the actual print session and annotation procedure. The capture script writes quality labels as strings such as good and bad, while the classifier dataset expects numeric binary labels. Convert and validate these labels before using captured data for training. Also verify that each saved image path resolves from DATA_DIR.
 
-Evaluate the model against the 10% hold-out test set:
+Run:
 
-```bash
-python test.py
+    python make_data.py
 
-```
+Use W/A/S/D to move the ROI and Q to exit.
 
-The script outputs top-1 accuracy for each individual parameter head and computes an overall accuracy score. Evaluation metrics are generated solely from deterministic (non-augmented) center-cropped images.
+### Camera server
 
-## 10. Inference and Deployment
+camera_server.py provides two endpoints:
 
-To utilize the trained checkpoint for actual parameter inference:
+- /video.mjpg — MJPEG camera stream.
+- /snapshot.jpg — latest frame as a JPEG image.
 
-1. Load the saved `.ckpt` weights into the model.
-2. Capture live frames (e.g., via `camera_server.py`).
+Run it with:
 
+    python camera_server.py
 
-3. Execute a forward pass. The `argmax` of each head's logits dictates the predicted class.
+The script uses camera index 1 and starts Flask on port 8081, bound to 0.0.0.0. Change the camera index as needed. Binding to all network interfaces may expose the camera feed to other devices on the network; use only in a trusted environment unless access controls are added.
 
+## Fuzzy-rule experiments
 
+The fuzzy directory contains rule-based experiments that map combinations of Good/Bad uniformity, continuity, and adhesion labels to qualitative actions such as Increase, Decrease, and Remain. The controller applies fixed increments to flow rate, feed rate, Z offset, and hotend temperature, while config.py clamps values to configured bounds.
 
-**Preliminary Smoke Test:** Experimental trial runs using `samples.py` have recorded processing 8 predictions in approximately 0.56 seconds. *Note: This represents a localized software execution test confirming functional inference loops, not a definitive real-time performance benchmark for hardware deployment.*
+simulation.py demonstrates an experimental webcam loop that classifies the three quality attributes, buffers predictions for majority voting, and passes the resulting labels to the fuzzy controller.
 
-**Fuzzy Logic Integration:** In deployment, the script buffers 10 consecutive predictions. The majority class is selected, and its frequency is divided by 10 to yield the `Confidence` score. These values are passed to `fuzzy/main.py` to calculate the crisp adjustment gain (`k`) and formulate the modifying G-Code command.
+These components are prototypes, not validated printer-control software. Heuristic rules do not guarantee that a proposed adjustment is physically correct or safe for a specific printer, material, or print condition. Some fuzzy scripts reference older regression model modules or may need import-path adjustments.
 
-## 11. Results and Reproducibility
+Do not connect this experimental logic to a live printer without independent validation, conservative safety limits, a controlled test procedure, and a reliable mechanism to prevent unintended motion or temperature changes.
 
-The baseline model demonstrates strong capability in evaluating discrete printing states.
+## Limitations and reproducibility
 
-| Model / Architecture | Flow Rate Acc | Feed Rate Acc | Z-Offset Acc | Hotend Acc | Overall Test Acc |
-| --- | --- | --- | --- | --- | --- |
-| Residual Attention-56 | 92.31% | 90.99% | 91.99% | 77.25% | **88.14%**<br> |
+Before treating this repository as a reproducible research release, address the following:
 
-Note: Hotend temperature yields the lowest accuracy due to higher visual ambiguity in the thermal signatures of the filament.
+1. **Machine-specific paths:** several scripts contain absolute Windows paths. Replace them with portable configuration or command-line arguments.
+2. **Potential data leakage:** train/validation and test subsets may overlap because the current split code generates them in separate random_split calls.
+3. **Unpinned dependencies:** no requirements.txt or environment lockfile is currently present.
+4. **Legacy model interfaces:** samples.py, full_model.py, and fuzzy/command.py refer to interfaces or modules that do not align with the current three-output classifier.
+5. **Hard-coded checkpoints:** training, evaluation, and inference scripts should accept checkpoint paths through configuration or CLI arguments.
+6. **Capture/training schema mismatch:** make_data.py writes string labels and a capture-oriented CSV schema, while the classifier loader expects numeric binary labels and nozzle coordinates.
+7. **Metric coverage:** accuracy alone may hide class imbalance. Consider per-class counts, precision, recall, F1-score, confusion matrices, and calibration where appropriate.
+8. **No verified benchmark table:** publish dataset size, split protocol, hardware, runtime methodology, checkpoint, and metrics only after reproducing the measurements.
+9. **Deployment scope:** camera capture and streaming utilities exist, but the repository does not provide a unified, packaged deployment service or a verified interface for sending commands to a printer.
 
-## 12. Troubleshooting
+## Recommended workflow
 
-* **CUDA Out-of-Memory:** Reduce `batch_size` in the data configuration or decrease the number of `trainable_layers` if fine-tuning.
+1. Validate the annotation CSV, binary labels, image paths, and nozzle coordinates.
+2. Replace machine-specific paths and record the software/hardware environment.
+3. Create and persist a deterministic, non-overlapping train/validation/test split.
+4. Train a baseline using train.py and retain the configuration, logs, and selected checkpoint.
+5. Evaluate on the untouched test split after correcting the split logic.
+6. Inspect representative predictions using predict.py and verify the crop matches training preprocessing.
+7. Experiment with batch size and learning rate in controlled runs. Treat separate backbone/head learning rates as a proposed experiment until implemented and measured.
+8. Evaluate fuzzy parameter adjustments separately from image-classification performance before considering any physical printer integration.
 
+## License
 
-* **Poor Validation Accuracy:** Verify that lighting conditions during data capture match those of the training set. The model is highly sensitive to illumination variances.
+No license file is present in the current repository tree. Unless a license is added by the project owner, do not assume the code is released under a specific open-source license.
 
-
-* **Tensor Shape Mismatch:** Ensure input images are strictly resized to `224x224` before being passed to the model.
-
-
-* **Missing Dataset / DataLoader Errors:** Check that `features_mapping.csv` paths match the local absolute or relative directory structure.
-
-## 13. Research Roadmap
-
-While the baseline establishes a robust spatial classification pipeline, future iterations aim to address dynamic printing variables:
-
-* **Spatiotemporal Modeling:** Transitioning from static CNNs to Temporal Convolutional Networks (TCN) or LSTM architectures to model extrusion dynamics and sequential state changes over time.
-* **Uncertainty Quantification:** Implementing predictive uncertainty estimation to filter out ambiguous frames before they reach the fuzzy logic controller, thereby preventing erratic G-Code adjustments.
-* **Geometric Verification:** Incorporating 2D camera calibration pipelines to explicitly measure physical extrusion widths and line geometry, serving as deterministic ground-truth anchors.
-* **Generalization:** Evaluating transfer learning efficacy across diverse materials (PETG, ABS, TPU) and varying color profiles.
-
-
-
-## 14. Limitations
-
-* **Illumination Dependency:** Image characteristics are highly susceptible to ambient lighting and shadows cast by the moving print head.
-
-
-* **Ambiguity of Physical States:** Multiple parameter configurations (e.g., slightly low flow rate vs. slightly high Z-offset) can yield visually identical extrusion morphologies, limiting deterministic accuracy from a single camera angle.
-
-
-* **Mechanical Isolation:** The model assumes the printer hardware is structurally sound; it cannot differentiate between parameter-induced defects and physical hardware failures (e.g., loose belts, clogged nozzles).
-
-
-
-## 15. Citation & License
-
-If you utilize this repository or architecture in your research, please cite the original project work appropriately.
-*License information: Not currently documented. Please contact the repository owner for usage rights.*
-
-```
-
-```
+If this repository supports a publication or incorporates third-party research code, add verified citations, attribution, and applicable license notices here.
